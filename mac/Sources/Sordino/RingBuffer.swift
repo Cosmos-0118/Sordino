@@ -12,9 +12,13 @@ final class RingBuffer {
     private var w = 0
     private var primed = false
     var underruns = 0, overflows = 0, lastWriteN = 0, lastReadN = 0
+    /// mach ticks of the last write; the pipeline's watchdog uses it to spot a capture that went silent.
+    private(set) var lastWriteTicks: UInt64 = mach_absolute_time()
+    let sampleRate: Double
     private let lock: UnsafeMutablePointer<os_unfair_lock>
 
     init(sampleRate: Double) {
+        self.sampleRate = sampleRate
         target = Int(sampleRate * 0.04)      // 40 ms cushion
         maxFill = Int(sampleRate * 0.12)     // drop above 120 ms
         cap = Int(sampleRate * 0.5)
@@ -31,6 +35,7 @@ final class RingBuffer {
         for i in 0..<n { buf[(w + i) % cap] = p[i] }
         w += n
         lastWriteN = n
+        lastWriteTicks = mach_absolute_time()
         if w - r > maxFill { r = w - target; overflows += 1 }
         os_unfair_lock_unlock(lock)
     }

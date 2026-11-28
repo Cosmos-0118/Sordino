@@ -71,7 +71,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// so a switch never gets torn down mid-animation.
     private func currentSignature() -> String {
         [pipe.inputs.map { $0.uid + $0.name }.joined(), pipe.outputs.map { $0.uid + $0.name }.joined(),
-         pipe.inputUID, pipe.outputUID, pipe.mode.rawValue, pipe.status ?? "", pipe.micMode,
+         pipe.activeInput?.uid ?? "", pipe.activeOutput?.uid ?? "", pipe.mode.rawValue, pipe.status ?? "", pipe.micMode,
+         pipe.isRunning ? "on" : "off",
          pipe.blackHole == nil ? "0" : "1"].joined(separator: "|")
     }
 
@@ -88,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshers.append { [weak self, weak header] in
             guard let self, let header else { return }
             header.isOn = self.pipe.isRunning
-            header.subtitle = self.pipe.isRunning ? "On — cleaning your voice" : "Off"
+            header.subtitle = !self.pipe.isRunning ? "Off" : (self.pipe.status == nil ? "On — cleaning your voice" : "On — reconnecting…")
         }
         let meter = LevelMeterView(model: pipe.meter)
         add(view: meter)
@@ -99,14 +100,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  message: "Run “brew install --cask blackhole-2ch”, then restart your Mac."))
         }
         if let s = pipe.status {
-            add(view: NoticeView(symbol: "xmark.octagon.fill", tint: .systemRed, title: "Something went wrong", message: s))
+            if pipe.isRunning {
+                add(view: NoticeView(symbol: "arrow.triangle.2.circlepath", tint: .systemOrange, title: "Reconnecting…", message: s))
+            } else {
+                add(view: NoticeView(symbol: "xmark.octagon.fill", tint: .systemRed, title: "Something went wrong", message: s))
+            }
         }
 
         // Microphone
         menu.addItem(.separator())
         addSection("Microphone")
         for dev in pipe.inputs {
-            addChoice(dev.name, symbol: Self.inputSymbol(dev.name), selected: dev.uid == pipe.inputUID) { [weak self] in
+            addChoice(dev.name, symbol: Self.inputSymbol(dev.name), selected: dev.uid == pipe.activeInput?.uid) { [weak self] in
                 self?.pipe.inputUID = dev.uid
             }
         }
@@ -115,10 +120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Virtual mic (loopback devices first, everything else tucked into a submenu)
         menu.addItem(.separator())
         addSection("Virtual Mic")
-        let loopbacks = pipe.outputs.filter { $0.isVirtualLoopback || $0.uid == pipe.outputUID }
-        let others = pipe.outputs.filter { !($0.isVirtualLoopback || $0.uid == pipe.outputUID) }
+        let activeOut = pipe.activeOutput?.uid
+        let loopbacks = pipe.outputs.filter { $0.isVirtualLoopback || $0.uid == activeOut }
+        let others = pipe.outputs.filter { !($0.isVirtualLoopback || $0.uid == activeOut) }
         for dev in loopbacks {
-            addChoice(dev.name, symbol: "point.3.connected.trianglepath.dotted", selected: dev.uid == pipe.outputUID) { [weak self] in
+            addChoice(dev.name, symbol: "point.3.connected.trianglepath.dotted", selected: dev.uid == activeOut) { [weak self] in
                 self?.pipe.outputUID = dev.uid
             }
         }

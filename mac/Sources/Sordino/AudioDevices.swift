@@ -59,6 +59,16 @@ enum AudioDevices {
         return list.reduce(0) { $0 + Int($1.mNumberChannels) }
     }
 
+    static func outputChannels(_ id: AudioDeviceID) -> Int { channels(id, kAudioDevicePropertyScopeOutput) }
+
+    /// False once a device is unplugged / its driver goes away (its ID is then stale).
+    static func isAlive(_ id: AudioDeviceID) -> Bool {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsAlive, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var alive: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &alive) == noErr && alive != 0
+    }
+
     static func defaultInput() -> AudioDeviceID? {
         var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         var id = AudioDeviceID(0)

@@ -3,22 +3,36 @@ import AppKit
 import AudioToolbox
 import CoreAudio
 import ServiceManagement
+import os
 
 /// Drives only the level meter, so 20 Hz updates never re-render the rest of the menu.
 final class LevelModel: ObservableObject {
     @Published var level: Float = 0
 }
 
-/// Mic -> Apple voice processing (VPIO) -> [high-pass, limiter] -> virtual mic (BlackHole).
-///
-/// Threading: UI state lives on the main thread. All AVAudioEngine / CoreAudio work runs on the
-/// serial `q`, so toggling or switching devices never blocks the UI.
 enum Mode: String, CaseIterable, Identifiable {
     case voiceIsolation = "Voice Isolation"
     case voiceProcessing = "Voice Processing"
     var id: String { rawValue }
 }
 
+private let log = Logger(subsystem: "com.sordino.mac", category: "pipeline")
+
+/// Mic -> [AVCaptureSession (Voice Isolation) | Apple voice processing] -> ring -> high-pass + limiter
+/// -> AUHAL bound to the virtual mic (BlackHole).
+///
+/// Robustness model (desired state + watchdog):
+/// - The main thread only states what it WANTS: a `Config` (which mic, which virtual mic, which mode) or
+///   nil for off. It never starts or stops audio itself.
+/// - The serial queue `q` owns all audio objects. `reconcile()` runs after every relevant event and once
+///   a second. It rebuilds only when the wanted Config changed or the running pipeline is actually
+///   broken (a device vanished, capture stopped delivering, the output stopped rendering).
+/// - Unrelated churn is ignored: other apps' voice-processing aggregates appearing, sample-rate changes
+///   on BlackHole (the AUHAL converts), configuration notifications that didn't stop anything. This is
+///   what keeps a WhatsApp call starting during a Discord call from setting off a rebuild storm that
+///   disrupts both apps.
+/// - Repeated failures back off (1, 2, 4, 8, 15 s) and Sordino stays on, retrying, instead of switching
+///   itself off.
 final class Pipeline: ObservableObject {
     @Published var isRunning = false
     @Published var status: String?
@@ -26,18 +40,28 @@ final class Pipeline: ObservableObject {
     @Published var micMode = "Standard"
     let meter = LevelModel()
 
-    @Published var inputUID: String { didSet { if inputUID != oldValue { save(); restartIfRunning() } } }
-    @Published var outputUID: String { didSet { if outputUID != oldValue { save(); restartIfRunning() } } }
-    @Published var mode: Mode { didSet { if mode != oldValue { save(); restartIfRunning() } } }
-    @Published var highPass: Bool { didSet { save(); let v = highPass; q.async { self.eq?.bypass = !v } } }
-    @Published var limiter: Bool { didSet { save(); let v = limiter; q.async { self.limiterUnit?.bypass = !v } } }
-    @Published var agc: Bool { didSet { save(); let v = agc; q.async { self.capture?.inputNode.isVoiceProcessingAGCEnabled = v } } }
+    /// The user's choices. If a chosen device is unplugged, a fallback is used until it comes back.
+    @Published var inputUID: String { didSet { if inputUID != oldValue { save(); pushConfig() } } }
+    @Published var outputUID: String { didSet { if outputUID != oldValue { save(); pushConfig() } } }
+    @Published var mode: Mode { didSet { if mode != oldValue { save(); pushConfig() } } }
+    @Published var highPass: Bool { didSet { save(); dsp.highPass = highPass } }
+    @Published var limiter: Bool { didSet { save(); dsp.limiter = limiter } }
+    @Published var agc: Bool {
+        didSet {
+            save()
+            let v = agc
+            q.async { self.agcOn = v; self.engine?.inputNode.isVoiceProcessingAGCEnabled = v }
+        }
+    }
     @Published var useAsDefault: Bool {
         didSet {
             save()
-            guard isRunning, mode == .voiceIsolation else { return }
             let on = useAsDefault
-            q.async { on ? self.applyDefaultInput() : self.restoreDefaultInput() }
+            q.async {
+                self.useDefaultOn = on
+                guard self.built?.mode == .voiceIsolation else { return }
+                on ? self.applyDefaultInput() : self.restoreDefaultInput()
+            }
         }
     }
     @Published var launchAtLogin: Bool {
@@ -48,25 +72,44 @@ final class Pipeline: ObservableObject {
         }
     }
 
-    // Owned by `q`.
-    private let q = DispatchQueue(label: "sordino.audio", qos: .userInteractive)
-    private var capture: AVAudioEngine?
-    private var playback: AVAudioEngine?
-    private var eq: AVAudioUnitEQ?
-    private var limiterUnit: AVAudioUnitEffect?
-    private var observers: [NSObjectProtocol] = []
-    private var ignoreConfigUntil = Date.distantPast
-    private var micCapture: MicCapture?
-    private var ringRef: RingBuffer?
-    private var routedOutput: AudioDeviceID?
+    // MARK: audio state (owned by `q`)
 
-    private var rawLevel: Float = 0     // written by audio thread, read by UI timer
+    private let q = DispatchQueue(label: "sordino.audio", qos: .userInteractive)
+    private let dsp = VoiceDSP()
+    private var engine: AVAudioEngine?          // Voice Processing capture
+    private var mic: MicCapture?                // Voice Isolation capture
+    private var output: VirtualMicOutput?
+    private var ring: RingBuffer?
+    private var observers: [NSObjectProtocol] = []
+    private var timer: DispatchSourceTimer?
+
+    private var wanted: Config?                 // what the UI asked for; nil = off
+    private var attempted: Config?              // config of the last build attempt
+    private var built: Config?                  // config that is running right now
+    private var attemptAt: Double = 0
+    private var builtAt: Double = 0
+    private var failures = 0
+    private var lastError: String?
+    private var shownStatus: String?
+    private var lastDefaultApply: Double = 0
+    private var agcOn = true
+    private var useDefaultOn = true
+
+    private var rawLevel: Float = 0             // written by audio threads, read by the UI timer
     private var tick = 0
+    private var pendingPush: DispatchWorkItem?
     private let d = UserDefaults.standard
 
     var inputs: [AudioDevice] { devices.filter { $0.hasInput && !$0.isVirtualLoopback && !$0.isInternalAggregate } }
     var outputs: [AudioDevice] { devices.filter { $0.hasOutput && !$0.isInternalAggregate } }
     var blackHole: AudioDevice? { devices.first { $0.name.lowercased().contains("blackhole") && $0.hasOutput } }
+
+    /// The mic actually used: the user's choice, else the built-in mic, else anything.
+    var activeInput: AudioDevice? {
+        inputs.first { $0.uid == inputUID } ?? inputs.first { $0.name.contains("MacBook") } ?? inputs.first
+    }
+    /// The virtual mic actually used: the user's choice, else BlackHole. Never falls back to real speakers.
+    var activeOutput: AudioDevice? { outputs.first { $0.uid == outputUID } ?? blackHole }
 
     init() {
         inputUID = d.string(forKey: "inputUID") ?? ""
@@ -77,17 +120,37 @@ final class Pipeline: ObservableObject {
         agc = d.object(forKey: "agc") as? Bool ?? true
         useAsDefault = d.object(forKey: "useAsDefault") as? Bool ?? true
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        dsp.highPass = highPass
+        dsp.limiter = limiter
+        agcOn = agc
+        useDefaultOn = useAsDefault
+
         refreshDevices()
         AudioDevices.observeChanges { [weak self] in self?.refreshDevices() }
         AudioDevices.observeDefaultInput { [weak self] in self?.defaultInputChanged() }
 
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { [weak self] _ in
             guard let self else { return }
-            self.q.sync { self.restoreDefaultInput() }
+            self.q.sync {
+                self.wanted = nil
+                self.teardown()
+                self.restoreDefaultInput()
+            }
+        }
+        // After sleep, devices and capture sessions are often dead: check right away instead of
+        // waiting for the stall detector.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.refreshDevices(); self?.pushConfig() }
         }
         // .common so the meter keeps updating while the menu is open (menu tracking runs a non-default mode).
-        let timer = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in self?.uiTick() }
-        RunLoop.main.add(timer, forMode: .common)
+        let uiTimer = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in self?.uiTick() }
+        RunLoop.main.add(uiTimer, forMode: .common)
+
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+        t.setEventHandler { [weak self] in self?.reconcile() }
+        t.resume()
+        timer = t
 
         if CommandLine.arguments.contains("--selftest") { selfTest() }
         else if d.object(forKey: "enabled") as? Bool ?? true { start() }
@@ -98,7 +161,6 @@ final class Pipeline: ObservableObject {
         let l = isRunning ? rawLevel : 0
         if abs(l - meter.level) > 0.002 || (l == 0 && meter.level != 0) { meter.level = l }
         if tick % 20 == 0 {
-            if isRunning { checkRouting() }
             let m = Self.micModeName()
             if m != micMode { micMode = m }
         }
@@ -110,15 +172,13 @@ final class Pipeline: ObservableObject {
         d.set(useAsDefault, forKey: "useAsDefault"); d.set(mode.rawValue, forKey: "mode")
     }
 
+    /// Device list changed. Other apps' private aggregates come and go constantly during calls; those only
+    /// refresh the menu. A rebuild happens only if the mic or virtual mic we use changed.
     func refreshDevices() {
         let all = AudioDevices.all()
-        if all != devices { devices = all }
-        if !inputs.contains(where: { $0.uid == inputUID }) {
-            inputUID = inputs.first { $0.name.contains("MacBook") }?.uid ?? inputs.first?.uid ?? ""
-        }
-        if !outputs.contains(where: { $0.uid == outputUID }) {
-            outputUID = blackHole?.uid ?? ""
-        }
+        guard all != devices else { return }
+        devices = all
+        pushConfig()
     }
 
     // MARK: control (main thread)
@@ -128,10 +188,13 @@ final class Pipeline: ObservableObject {
     func start(persist: Bool = true) {
         if persist { d.set(true, forKey: "enabled") }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: launch()
+        case .authorized:
+            isRunning = true            // optimistic: UI responds instantly
+            status = nil
+            sendConfig()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { ok in
-                DispatchQueue.main.async { ok ? self.launch() : (self.status = "Microphone access denied") }
+                DispatchQueue.main.async { ok ? self.start(persist: persist) : (self.status = "Microphone access denied") }
             }
         default:
             isRunning = false
@@ -143,77 +206,156 @@ final class Pipeline: ObservableObject {
         if persist { d.set(false, forKey: "enabled") }
         isRunning = false
         status = nil
-        q.async { self.teardown(restoreDefault: true) }
+        sendConfig()
     }
 
-    private func restartIfRunning() { if isRunning { launch() } }
+    /// Debounced: bursts of device notifications collapse into one reconcile.
+    private func pushConfig() {
+        pendingPush?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.sendConfig() }
+        pendingPush = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
+    }
 
-    private func launch() {
-        isRunning = true            // optimistic: UI responds instantly
-        status = nil
-        let inID = inputs.first { $0.uid == inputUID }?.id
-        let outID = outputs.first { $0.uid == outputUID }?.id
-        let cfg = Config(inputID: inID, inputUID: inputs.first { $0.uid == inputUID }?.uid, outputID: outID, mode: mode, agc: agc, highPass: highPass, limiter: limiter, useDefault: useAsDefault)
+    private func sendConfig() {
+        pendingPush?.cancel(); pendingPush = nil
+        let want: Config? = isRunning
+            ? Config(mode: mode, inputUID: activeInput?.uid, inputID: activeInput?.id, outputUID: activeOutput?.uid, outputID: activeOutput?.id)
+            : nil
         q.async {
-            let error = self.build(cfg)
-            if let error { DispatchQueue.main.async { self.isRunning = false; self.status = error } }
+            self.wanted = want
+            self.reconcile()
         }
     }
 
-    // MARK: engines (queue `q`)
-
-    private struct Config {
-        let inputID: AudioDeviceID?, inputUID: String?, outputID: AudioDeviceID?, mode: Mode
-        let agc: Bool, highPass: Bool, limiter: Bool, useDefault: Bool
+    /// macOS moves the default input on its own when a headset connects. (main thread)
+    private func defaultInputChanged() {
+        guard isRunning else { return }
+        q.async {
+            guard let built = self.built else { return }
+            switch built.mode {
+            case .voiceIsolation:
+                // Keep the virtual mic as the default so apps don't silently bypass Sordino.
+                // Rate-limited so Sordino never ping-pongs with another app.
+                let now = Clock.now()
+                guard self.useDefaultOn, now - self.lastDefaultApply > 2 else { return }
+                self.lastDefaultApply = now
+                self.applyDefaultInput()
+            case .voiceProcessing:
+                self.reconcile()    // VPIO follows the default input; health check rebinds if needed
+            }
+        }
     }
+
+    // MARK: reconcile (queue `q`)
+
+    private struct Config: Equatable {
+        let mode: Mode
+        let inputUID: String?, inputID: AudioDeviceID?
+        let outputUID: String?, outputID: AudioDeviceID?
+    }
+
+    private func reconcile() {
+        guard let want = wanted else {
+            if attempted != nil || built != nil {
+                log.info("stopping")
+                teardown()
+                restoreDefaultInput()
+                attempted = nil; failures = 0; lastError = nil; shownStatus = nil
+            }
+            return
+        }
+        let now = Clock.now()
+        if want == attempted {
+            guard let problem = healthProblem(now) else {
+                if failures > 0, now - builtAt > 10 { failures = 0 }
+                setStatus(nil)
+                return
+            }
+            let wait = min(15, pow(2, Double(failures)))
+            guard now - attemptAt >= wait else {
+                setStatus("Reconnecting: \(problem)")
+                return
+            }
+            failures += 1
+            log.notice("rebuilding (\(problem, privacy: .public)), attempt \(self.failures)")
+        } else {
+            failures = 0
+            log.info("building for new config")
+        }
+        attempted = want
+        attemptAt = now
+        lastError = build(want)
+        setStatus(lastError.map { "Reconnecting: \($0)" })
+    }
+
+    /// nil when the running pipeline is healthy; otherwise a short user-facing reason.
+    private func healthProblem(_ now: Double) -> String? {
+        guard let cfg = built, let out = output, let ring else { return lastError ?? "starting" }
+        let settled = now - builtAt > 2.5
+        if let id = cfg.outputID, !AudioDevices.isAlive(id) { return "the virtual mic disappeared" }
+        if let id = cfg.inputID, !AudioDevices.isAlive(id) { return "the microphone was disconnected" }
+        if !out.isBound { return "audio was routed away from the virtual mic" }
+        if settled, now - Clock.seconds(out.lastRenderTicks) > 1.5 { return "the virtual mic stopped" }
+        if settled, now - Clock.seconds(ring.lastWriteTicks) > 1.5 { return "the microphone stopped sending audio" }
+        if cfg.mode == .voiceProcessing {
+            if engine?.isRunning != true { return "voice processing stopped" }
+            if let id = cfg.inputID, AudioDevices.defaultInput() != id { return "the system input changed" }
+        }
+        return nil
+    }
+
+    private func setStatus(_ s: String?) {
+        guard s != shownStatus else { return }
+        shownStatus = s
+        DispatchQueue.main.async { if self.isRunning, self.status != s { self.status = s } }
+    }
+
+    // MARK: build / teardown (queue `q`)
 
     private func build(_ cfg: Config) -> String? {
-        teardown(restoreDefault: false)
-        guard let outID = cfg.outputID else {
-            return "No virtual mic found. Install BlackHole: brew install --cask blackhole-2ch"
+        teardown()
+        guard let outID = cfg.outputID else { return "No virtual mic found. Install BlackHole: brew install --cask blackhole-2ch" }
+        guard let inUID = cfg.inputUID, let inID = cfg.inputID else { return "No microphone found" }
+        let onPeak: (Float) -> Void = { [weak self] peak in
+            guard let self else { return }
+            self.rawLevel = max(peak, self.rawLevel * 0.85)
         }
         do {
-            var cap: AVAudioEngine?
-            var rate = MicCapture.sampleRate
-            var mic: MicCapture?
-            var ring: RingBuffer!
-            let onPeak: (Float) -> Void = { [weak self] peak in
-                guard let self else { return }
-                self.rawLevel = max(peak, self.rawLevel * 0.85)
-            }
+            let ring: RingBuffer
             switch cfg.mode {
             case .voiceIsolation:
-                // Explicit mic via AVCaptureSession: independent of the system default input,
-                // so the virtual mic can safely be the default. macOS Mic Mode applies.
-                ring = RingBuffer(sampleRate: rate)
-                guard let uid = cfg.inputUID, let m = MicCapture(deviceUID: uid, ring: ring, onPeak: onPeak) else {
-                    throw NSError(domain: "Sordino", code: 2, userInfo: [NSLocalizedDescriptionKey: "Couldn't open the microphone"])
+                // Explicit mic via AVCaptureSession: independent of the system default input, so the
+                // virtual mic can safely be the default. macOS Mic Mode (Voice Isolation) applies.
+                ring = RingBuffer(sampleRate: MicCapture.sampleRate)
+                guard let m = MicCapture(deviceUID: inUID, ring: ring, onPeak: onPeak) else {
+                    throw Self.err("Couldn't open the microphone")
                 }
+                if useDefaultOn { applyDefaultInput() }
+                m.start()
                 mic = m
             case .voiceProcessing:
-                // Classic Apple voice processing (echo cancel + AGC). It binds to the system default
-                // input, so the virtual mic can't be the default in this mode. Switch the default
-                // BEFORE creating the engine: VPIO binds to whatever is default at creation, and
-                // binding to BlackHole would loop the virtual mic back into itself.
-                ignoreConfigUntil = Date().addingTimeInterval(2)
-                useAsSystemInput(cfg.inputID)
-                if let cur = AudioDevices.defaultInput(), AudioDevices.all().first(where: { $0.id == cur })?.isVirtualLoopback ?? false {
-                    throw NSError(domain: "Sordino", code: 3, userInfo: [NSLocalizedDescriptionKey:
-                        "Voice Processing needs a real mic as the system input. Set Sound › Input to your microphone."])
+                // VPIO binds to the system default input at creation, so point that at the chosen mic
+                // first; binding to BlackHole would loop the virtual mic into itself.
+                if AudioDevices.defaultInput() != inID {
+                    AudioDevices.setDefaultInput(inID)
+                    Thread.sleep(forTimeInterval: 0.2)
                 }
-                let engine = AVAudioEngine()
-                let input = engine.inputNode
+                if let cur = AudioDevices.defaultInput(), AudioDevices.all().first(where: { $0.id == cur })?.isVirtualLoopback ?? false {
+                    throw Self.err("Voice Processing needs a real mic as the system input. Set Sound › Input to your microphone.")
+                }
+                let e = AVAudioEngine()
+                let input = e.inputNode
                 try input.setVoiceProcessingEnabled(true)
-                input.isVoiceProcessingAGCEnabled = cfg.agc
+                input.isVoiceProcessingAGCEnabled = agcOn
                 if #available(macOS 14.0, *) {
                     input.voiceProcessingOtherAudioDuckingConfiguration =
                         AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
                 }
                 let fmt = input.outputFormat(forBus: 0)
-                guard fmt.sampleRate > 0 else { throw NSError(domain: "Sordino", code: 1, userInfo: [NSLocalizedDescriptionKey: "Input device unavailable"]) }
-                rate = fmt.sampleRate
-                ring = RingBuffer(sampleRate: rate)
-                let r = ring!
+                guard fmt.sampleRate > 0, fmt.channelCount > 0 else { throw Self.err("Input device unavailable") }
+                ring = RingBuffer(sampleRate: fmt.sampleRate)
+                let r = ring
                 input.installTap(onBus: 0, bufferSize: 512, format: fmt) { buf, _ in
                     guard let ch = buf.floatChannelData else { return }
                     let n = Int(buf.frameLength)
@@ -222,79 +364,47 @@ final class Pipeline: ObservableObject {
                     for i in 0..<n { peak = max(peak, abs(ch[0][i])) }
                     onPeak(peak)
                 }
-                cap = engine
+                engine = e
+                try e.start()
+                // The engine stops itself on configuration changes; check promptly instead of waiting
+                // for the stall detector. reconcile() ignores notifications that didn't break anything.
+                observers.append(NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: e, queue: nil) { [weak self] _ in
+                    self?.q.asyncAfter(deadline: .now() + 0.3) { self?.reconcile() }
+                })
             }
-            let ring0 = ring!
-            ringRef = ring0
+            self.ring = ring
 
-            let pb = AVAudioEngine()
-            let mono = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1)!
-            let src = AVAudioSourceNode(format: mono) { _, _, frames, abl in
-                let list = UnsafeMutableAudioBufferListPointer(abl)
-                guard let p = list[0].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-                ring0.read(p, Int(frames))
-                return noErr
+            dsp.configure(sampleRate: ring.sampleRate)
+            let out = try VirtualMicOutput(deviceID: outID, sampleRate: ring.sampleRate, ring: ring, dsp: dsp)
+            try out.start()
+            guard out.isBound else {
+                out.stop()
+                throw Self.err("Couldn't route audio to the virtual mic")
             }
-            let eq = AVAudioUnitEQ(numberOfBands: 1)
-            let band = eq.bands[0]
-            band.filterType = .highPass; band.frequency = 90; band.bandwidth = 0.7; band.bypass = false
-            eq.bypass = !cfg.highPass
-            let lim = AVAudioUnitEffect(audioComponentDescription: AudioComponentDescription(
-                componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_PeakLimiter,
-                componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0))
-            lim.bypass = !cfg.limiter
-            pb.attach(src); pb.attach(eq); pb.attach(lim)
-            pb.connect(src, to: eq, format: mono)
-            pb.connect(eq, to: lim, format: mono)
-            pb.connect(lim, to: pb.mainMixerNode, format: mono)
-
-            // Change the system default input BEFORE starting playback: a device change after
-            // start makes AVAudioEngine re-route its output to the default device (the speakers),
-            // which creates a speaker -> mic feedback howl.
-            if cfg.useDefault && cfg.mode == .voiceIsolation { applyDefaultInput(); Thread.sleep(forTimeInterval: 0.3) }
-
-            // Bind the output to the virtual mic as the last step before start, then verify.
-            pb.prepare()
-            guard Self.setDevice(pb.outputNode.audioUnit, outID) == noErr else {
-                throw NSError(domain: "Sordino", code: 4, userInfo: [NSLocalizedDescriptionKey: "Couldn't route audio to the virtual mic"])
-            }
-            try cap?.start()
-            mic?.start()
-            try pb.start()
-            guard Self.boundDevice(pb.outputNode.audioUnit) == outID else {
-                pb.stop()
-                throw NSError(domain: "Sordino", code: 5, userInfo: [NSLocalizedDescriptionKey: "Audio wasn't routed to the virtual mic, so Sordino stopped to avoid feedback"])
-            }
-            capture = cap; micCapture = mic; playback = pb; self.eq = eq; limiterUnit = lim; routedOutput = outID
-
-            let onConfigChange: (Notification) -> Void = { [weak self] _ in
-                guard let self else { return }
-                self.q.async {
-                    // Never let the processed voice reach real speakers, even for a moment.
-                    if !self.playbackIsSafe() { self.playback?.stop() }
-                    guard Date() > self.ignoreConfigUntil || self.playback?.isRunning == false else { return }
-                    DispatchQueue.main.async { self.restartIfRunning() }
-                }
-            }
-            observers = [NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: pb, queue: nil, using: onConfigChange)]
-            if let cap {
-                observers.append(NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: cap, queue: nil, using: onConfigChange))
-            }
+            output = out
+            built = cfg
+            builtAt = Clock.now()
+            log.info("running: mode=\(cfg.mode.rawValue, privacy: .public)")
             return nil
         } catch {
-            teardown(restoreDefault: false)
-            return "Start failed: \(error.localizedDescription)"
+            teardown()
+            log.error("build failed: \(error.localizedDescription, privacy: .public)")
+            return error.localizedDescription
         }
     }
 
-    private func teardown(restoreDefault: Bool) {
+    private func teardown() {
         observers.forEach(NotificationCenter.default.removeObserver); observers = []
-        capture?.inputNode.removeTap(onBus: 0)
-        capture?.stop(); playback?.stop()
-        capture = nil; playback = nil; eq = nil; limiterUnit = nil; routedOutput = nil
+        if let e = engine {
+            e.inputNode.removeTap(onBus: 0)
+            e.stop()
+        }
+        engine = nil
+        mic?.stop(); mic = nil
+        output?.stop(); output = nil
+        ring = nil
+        built = nil
         rawLevel = 0
-        micCapture?.stop(); micCapture = nil
-        if restoreDefault { restoreDefaultInput() }
     }
 
     /// Makes the virtual mic the system default input so apps pick it automatically.
@@ -302,10 +412,10 @@ final class Pipeline: ObservableObject {
         let all = AudioDevices.all()
         guard let bh = all.first(where: { $0.name.lowercased().contains("blackhole") && $0.hasInput }) else { return }
         let current = AudioDevices.defaultInput()
-        if current != bh.id, let cur = all.first(where: { $0.id == current }) {
+        guard current != bh.id else { return }
+        if let cur = all.first(where: { $0.id == current }), !cur.isVirtualLoopback {
             d.set(cur.uid, forKey: "previousDefaultInputUID")
         }
-        ignoreConfigUntil = Date().addingTimeInterval(2)
         AudioDevices.setDefaultInput(bh.id)
     }
 
@@ -316,79 +426,14 @@ final class Pipeline: ObservableObject {
               AudioDevices.defaultInput() == bh.id,
               let uid = d.string(forKey: "previousDefaultInputUID"),
               let prev = all.first(where: { $0.uid == uid && $0.hasInput }) else { return }
-        ignoreConfigUntil = Date().addingTimeInterval(2)
         AudioDevices.setDefaultInput(prev.id)
     }
 
+    private static func err(_ msg: String) -> NSError {
+        NSError(domain: "Sordino", code: 1, userInfo: [NSLocalizedDescriptionKey: msg])
+    }
+
     // MARK: helpers
-
-    /// True when playback is stopped or still bound to the virtual mic it was started on. (queue `q`)
-    private func playbackIsSafe() -> Bool {
-        guard let pb = playback, pb.isRunning, let want = routedOutput else { return true }
-        return Self.boundDevice(pb.outputNode.audioUnit) == want
-    }
-
-    /// Once a second: if playback ever drifted onto another device (e.g. the speakers), stop it and rebuild.
-    private func checkRouting() {
-        q.async {
-            guard !self.playbackIsSafe() else { return }
-            self.playback?.stop()
-            DispatchQueue.main.async { self.restartIfRunning() }
-        }
-    }
-
-    /// macOS changes the default input on its own when a headset (AirPods, USB, Bluetooth) connects.
-    /// Keep it where Sordino needs it, or apps silently bypass Sordino / VPIO cleans the wrong mic. (main thread)
-    private func defaultInputChanged() {
-        guard isRunning else { return }
-        let all = AudioDevices.all()
-        let current = AudioDevices.defaultInput()
-        switch mode {
-        case .voiceIsolation:
-            guard useAsDefault else { return }
-            let bh = all.first { $0.name.lowercased().contains("blackhole") && $0.hasInput }
-            guard let bh, current != bh.id else { return }
-            q.async { self.applyDefaultInput() }
-        case .voiceProcessing:
-            guard let want = inputs.first(where: { $0.uid == inputUID })?.id, current != want else { return }
-            // VPIO follows the default input, so put the chosen mic back and rebuild on it.
-            q.async {
-                AudioDevices.setDefaultInput(want)
-                DispatchQueue.main.async { self.restartIfRunning() }
-            }
-        }
-    }
-
-    /// Voice Processing: VPIO always captures the system default input, so make that the mic chosen in the menu.
-    private func useAsSystemInput(_ id: AudioDeviceID?) {
-        guard let id else { ensureRealDefault(preferred: nil); return }
-        if AudioDevices.defaultInput() != id {
-            AudioDevices.setDefaultInput(id)
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-    }
-
-    private func ensureRealDefault(preferred: AudioDeviceID?) {
-        let all = AudioDevices.all()
-        guard let cur = AudioDevices.defaultInput(), all.first(where: { $0.id == cur })?.isVirtualLoopback ?? true else { return }
-        let prevUID = d.string(forKey: "previousDefaultInputUID")
-        let real = all.first(where: { $0.uid == prevUID && $0.hasInput && !$0.isVirtualLoopback })?.id ?? preferred
-        if let real { AudioDevices.setDefaultInput(real); Thread.sleep(forTimeInterval: 0.2) }
-    }
-
-    @discardableResult
-    private static func setDevice(_ unit: AudioUnit?, _ id: AudioDeviceID) -> OSStatus {
-        guard let unit else { return -1 }
-        var dev = id
-        return AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
-    }
-
-    private static func boundDevice(_ unit: AudioUnit?) -> AudioDeviceID? {
-        guard let unit else { return nil }
-        var dev = AudioDeviceID(0); var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        guard AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, &size) == noErr else { return nil }
-        return dev
-    }
 
     private static func micModeName() -> String {
         switch AVCaptureDevice.activeMicrophoneMode {
@@ -401,19 +446,23 @@ final class Pipeline: ObservableObject {
     /// Opens the macOS Mic Mode picker (Voice Isolation / Wide Spectrum / Standard).
     func showMicModes() { AVCaptureDevice.showSystemUserInterface(.microphoneModes) }
 
-    /// `Sordino --selftest`: prints what the pipeline is doing for 8 s, then exits.
+    /// `Sordino --selftest [seconds]`: prints what the pipeline is doing once a second, then exits.
     private func selfTest() {
         start(persist: false)
+        let args = CommandLine.arguments
+        let limit = args.firstIndex(of: "--selftest").flatMap { i in i + 1 < args.count ? Int(args[i + 1]) : nil } ?? 8
         var n = 0
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
             guard let self else { return }
             n += 1
             let all = AudioDevices.all()
-            let name = { (id: AudioDeviceID?) in all.first { $0.id == id }?.name ?? "?" }
-            let bound = self.q.sync { Self.boundDevice(self.capture?.inputNode.audioUnit) }
-            print("t=\(n) running=\(self.isRunning) peak=\(String(format: "%.6f", self.rawLevel)) engineInput=\(name(bound)) defaultInput=\(name(AudioDevices.defaultInput())) status=\(self.status ?? "-") under=\(self.ringRef?.underruns ?? -1) over=\(self.ringRef?.overflows ?? -1) wN=\(self.ringRef?.lastWriteN ?? -1) rN=\(self.ringRef?.lastReadN ?? -1)")
+            let name = { (id: AudioDeviceID?) in all.first { $0.id == id }?.name ?? "-" }
+            let (out, bound, ring, problem) = self.q.sync {
+                (self.output?.deviceID, self.output?.isBound ?? false, self.ring, self.healthProblem(Clock.now()))
+            }
+            print("t=\(n) running=\(self.isRunning) peak=\(String(format: "%.6f", self.rawLevel)) out=\(name(out)) bound=\(bound) defaultInput=\(name(AudioDevices.defaultInput())) health=\(problem ?? "ok") status=\(self.status ?? "-") under=\(ring?.underruns ?? -1) over=\(ring?.overflows ?? -1) wN=\(ring?.lastWriteN ?? -1) rN=\(ring?.lastReadN ?? -1)")
             fflush(stdout)
-            if n >= 8 { self.stop(persist: false); t.invalidate(); exit(0) }
+            if n >= limit { self.stop(persist: false); t.invalidate(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) } }
         }
     }
 }
