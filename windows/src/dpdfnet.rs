@@ -15,6 +15,11 @@ use tract_onnx::prelude::*;
 type Result<T> = anyhow::Result<T>;
 
 pub const HOP: usize = 480;
+/// End-to-end lag of [`Dpdfnet::process`] in hops. Measured by cross-correlating input and output
+/// for both model sizes: 2400 samples = 5 hops (1 for the STFT overlap-add, 4 of model look-ahead).
+/// Everything that must stay time-aligned with the denoised audio (the pre-leveler's inverse gain,
+/// the whisper-rescue dry signal) is delayed by exactly this much; see `tests/denoise.rs`.
+pub const LATENCY_HOPS: usize = 5;
 const WIN: usize = 960;
 const BINS: usize = WIN / 2 + 1;
 
@@ -202,7 +207,8 @@ impl Dpdfnet {
         self.quiet_run = 0;
     }
 
-    /// Enhances one 10 ms hop. The output lags the input by one hop (10 ms).
+    /// Enhances one 10 ms hop. The output lags the input by [`LATENCY_HOPS`] hops (50 ms): one for
+    /// the STFT overlap-add plus the model's own look-ahead.
     pub fn process(&mut self, input: &[f32; HOP], output: &mut [f32; HOP]) -> Result<()> {
         if self.skip_idle {
             let rms = (input.iter().map(|s| s * s).sum::<f32>() / HOP as f32).sqrt();

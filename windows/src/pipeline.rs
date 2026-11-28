@@ -279,7 +279,10 @@ impl Downmixer {
             for c in 0..use_ch {
                 let o = base + c * 4;
                 let s = f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-                acc += s * self.weights[c];
+                // A dead channel's NaN/Inf must not leak in even at weight 0 (NaN * 0.0 is NaN).
+                if s.is_finite() {
+                    acc += s * self.weights[c];
+                }
             }
             out.push(acc);
         }
@@ -455,28 +458,50 @@ fn file_source_thread(shared: Arc<Shared>, samples: Arc<Vec<f32>>, params: Arc<P
     let _ = ready.send(Ok(()));
     let mut out = Vec::new();
     let chunk = dsp::FRAME;
+    let silence = vec![0.0f32; chunk];
     let start = std::time::Instant::now();
     let mut pos = 0usize;
     while !shared.stop.load(Relaxed) {
-        // Pace to real time.
+        // Pace to real time, including the silence that keeps the stream alive after the file
+        // ends (it must not run ahead of the clock or the ring buffer overflows).
         let due = (start.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
-        while pos < due && pos < samples.len() {
-            let end = (pos + chunk).min(samples.len());
+        while pos < due {
             out.clear();
-            chain.process(&samples[pos..end], &mut out);
+            if pos < samples.len() {
+                let end = (pos + chunk).min(samples.len());
+                chain.process(&samples[pos..end], &mut out);
+                pos = end;
+            } else {
+                chain.process(&silence, &mut out);
+                pos += chunk;
+            }
             if !out.is_empty() {
                 shared.ring.write(&out);
                 bump_peak(&shared, chain.peak);
                 shared.flowing.store(true, Release);
             }
-            pos = end;
-        }
-        if pos >= samples.len() {
-            // Keep the stream alive with silence after the file ends.
-            out.clear();
-            chain.process(&vec![0.0; chunk], &mut out);
-            shared.ring.write(&out);
         }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet(ch0: f32, ch1: f32, frames: usize) -> Vec<u8> {
+        (0..frames).flat_map(|i| [(ch0 * (i as f32 * 0.1).sin()).to_le_bytes(), ch1.to_le_bytes()]).flatten().collect()
+    }
+
+    #[test]
+    fn nan_on_a_dead_channel_does_not_poison_the_mix() {
+        let mut dm = Downmixer::new(2);
+        let mut out = Vec::new();
+        for _ in 0..60 {
+            out.clear();
+            dm.mix(&packet(0.3, f32::NAN, 480), &mut out);
+            assert!(out.iter().all(|s| s.is_finite()), "NaN leaked through the downmix");
+        }
+        assert!(out.iter().any(|s| s.abs() > 0.1), "live channel lost");
     }
 }

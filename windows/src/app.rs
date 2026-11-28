@@ -332,33 +332,40 @@ impl App {
             return;
         }
         let Some(cable) = self.cable_capture() else { return };
-        let cur = devices::default_capture_id().unwrap_or_default();
-        if cur == cable.id {
+        // Take over every role that isn't already on the virtual mic (Windows can move just one).
+        let not_cable = devices::capture_roles_where(|d| d.id != cable.id);
+        if not_cable.is_empty() {
             return;
         }
-        if self.mics.iter().any(|d| d.id == cur) {
-            self.st.previous_default_input_id = cur;
+        // Remember the real mic to give back later, from whichever role still points at one.
+        let prev = not_cable
+            .iter()
+            .filter_map(|&r| devices::default_capture_id_for_role(r))
+            .find(|id| self.mics.iter().any(|d| d.id == *id));
+        if let Some(prev) = prev {
+            self.st.previous_default_input_id = prev;
             self.save();
         }
         self.own_default_change = Instant::now();
-        let _ = defaultmic::set_default_capture(&cable.id);
+        let _ = defaultmic::set_default_capture_roles(&cable.id, &not_cable);
     }
 
     /// Puts the user's real default mic back (only if the virtual mic is still the default).
     fn restore_default(&mut self) {
         let Some(cable) = self.cable_capture() else { return };
-        if devices::default_capture_id().as_deref() != Some(cable.id.as_str()) {
+        let stuck = devices::capture_roles_where(|d| d.id == cable.id);
+        if stuck.is_empty() {
             return;
         }
-        self.set_real_default();
+        self.set_real_default(&stuck);
     }
 
-    /// Sets the user's previous mic (or the first real one) as the Windows default.
-    fn set_real_default(&mut self) -> bool {
+    /// Sets the user's previous mic (or the first real one) as the Windows default for `roles`.
+    fn set_real_default(&mut self, roles: &[i32]) -> bool {
         let prev = &self.st.previous_default_input_id;
         let Some(d) = self.mics.iter().find(|d| d.id == *prev).or_else(|| self.mics.first()) else { return false };
         self.own_default_change = Instant::now();
-        defaultmic::set_default_capture(&d.id).is_ok()
+        defaultmic::set_default_capture_roles(&d.id, roles).is_ok()
     }
 
     /// If a previous run was killed or Windows shut down while the virtual mic was the default,
@@ -368,11 +375,12 @@ impl App {
         if self.pipe.is_some() {
             return true;
         }
-        let Some(def) = devices::default_capture() else { return false };
-        if !def.is_virtual {
+        // Any role left on a virtual mic counts, not just Console (Discord follows Communications).
+        let stuck = devices::capture_roles_where(|d| d.is_virtual);
+        if stuck.is_empty() {
             return true;
         }
-        self.set_real_default()
+        self.set_real_default(&stuck)
     }
 
     /// Windows switches the default recording device by itself when a headset connects.
@@ -409,9 +417,12 @@ impl App {
                 self.save();
             }
             id if id.starts_with("engine:") => {
-                self.st.engine = id["engine:".len()..].to_string();
-                self.save();
-                self.restart_if_running();
+                // Re-selecting the active engine must not tear the pipeline down.
+                if self.st.engine != id["engine:".len()..] {
+                    self.st.engine = id["engine:".len()..].to_string();
+                    self.save();
+                    self.restart_if_running();
+                }
             }
             "opt:highpass" => {
                 self.st.highpass = !self.st.highpass;
@@ -432,8 +443,11 @@ impl App {
                 self.st.use_as_default = !self.st.use_as_default;
                 self.save();
                 if self.st.use_as_default {
+                    // During warm-up the pipeline isn't flowing yet; `tick` applies it once it is.
+                    self.default_pending = self.pipe.is_some();
                     self.apply_default();
                 } else {
+                    self.default_pending = false;
                     self.restore_default();
                 }
             }

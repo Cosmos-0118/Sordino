@@ -38,7 +38,8 @@ pub fn is_virtual_name(name: &str) -> bool {
 /// For a virtual cable's playback endpoint ("CABLE Input (VB-Audio Virtual Cable)") returns the
 /// matching recording endpoint name ("CABLE Output (VB-Audio Virtual Cable)").
 pub fn paired_capture_name(render_name: &str) -> String {
-    render_name.replace("Input", "Output").replace("input", "output")
+    // VB-CABLE Driver Pack 45+ also registers "CABLE In 16ch", which feeds the same "CABLE Output".
+    render_name.replace("In 16ch", "Output").replace("Input", "Output").replace("input", "output")
 }
 
 /// Lists active endpoints of one kind. COM must already be initialised on this thread.
@@ -76,6 +77,38 @@ pub fn default_capture_id() -> Option<String> {
     en.get_default_device_for_role(Direction::Capture, Role::Console).ok()?.get_id().ok()
 }
 
+/// The recording-device roles Windows keeps separate defaults for (eConsole, eMultimedia,
+/// eCommunications). Games and browsers follow Console; Discord/Teams/Zoom follow Communications.
+pub const CAPTURE_ROLES: [i32; 3] = [0, 1, 2];
+
+fn role_of(role: i32) -> Role {
+    match role {
+        0 => Role::Console,
+        1 => Role::Multimedia,
+        _ => Role::Communications,
+    }
+}
+
+/// Default capture endpoint ID for one role (see [`CAPTURE_ROLES`]).
+pub fn default_capture_id_for_role(role: i32) -> Option<String> {
+    let en = DeviceEnumerator::new().ok()?;
+    en.get_default_device_for_role(Direction::Capture, role_of(role)).ok()?.get_id().ok()
+}
+
+/// Roles whose current default recording device satisfies `pred`. Checks every role, not just
+/// Console, so a role left on a dead virtual mic can't hide behind a real mic on another role.
+pub fn capture_roles_where(pred: impl Fn(&AudioDevice) -> bool) -> Vec<i32> {
+    let Ok(en) = DeviceEnumerator::new() else { return vec![] };
+    CAPTURE_ROLES
+        .into_iter()
+        .filter(|&r| {
+            let Ok(dev) = en.get_default_device_for_role(Direction::Capture, role_of(r)) else { return false };
+            let (Ok(id), Ok(name)) = (dev.get_id(), dev.get_friendlyname()) else { return false };
+            pred(&AudioDevice { is_virtual: is_virtual_name(&name), id, name, direction: DirectionKind::Capture })
+        })
+        .collect()
+}
+
 /// Current default capture endpoint (console role), if Windows has one.
 pub fn default_capture() -> Option<AudioDevice> {
     let en = DeviceEnumerator::new().ok()?;
@@ -101,5 +134,6 @@ mod tests {
     #[test]
     fn pairs_cable_endpoints() {
         assert_eq!(paired_capture_name("CABLE Input (VB-Audio Virtual Cable)"), "CABLE Output (VB-Audio Virtual Cable)");
+        assert_eq!(paired_capture_name("CABLE In 16ch (VB-Audio Virtual Cable)"), "CABLE Output (VB-Audio Virtual Cable)");
     }
 }

@@ -83,6 +83,15 @@ APP_SRC=""
 download_release() {
     local url="https://github.com/$REPO/releases/latest/download/$APP_NAME.zip"
     curl -fsL -o "$WORK/$APP_NAME.zip" "$url" 2>/dev/null || return 1
+    # Verify the download against the checksum published with the release; if it is missing or
+    # does not match, fall back to building from source instead of running unverified code.
+    local expected actual
+    expected="$(curl -fsL "$url.sha256" 2>/dev/null | awk 'NR==1 {print tolower($1)}')" || return 1
+    actual="$(shasum -a 256 "$WORK/$APP_NAME.zip" | awk '{print tolower($1)}')"
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        warn "The Sordino download failed its integrity check; building from source instead."
+        return 1
+    fi
     ditto -x -k "$WORK/$APP_NAME.zip" "$WORK/release" || return 1
     [ -d "$WORK/release/$APP_NAME.app" ] || return 1
     APP_SRC="$WORK/release/$APP_NAME.app"

@@ -81,13 +81,20 @@ fn main() -> anyhow::Result<()> {
     if has("--process-file") {
         let i = args.iter().position(|a| a == "--process-file").unwrap();
         let (Some(inp), Some(out)) = (args.get(i + 1), args.get(i + 2)) else {
-            println!("{USAGE}");
-            return Ok(());
+            eprintln!("{USAGE}");
+            std::process::exit(2);
         };
         let input = wavio::read_mono_48k(Path::new(inp))?;
-        let params = dsp::Params::new(!has("--no-denoise"), true, true, has("--agc"));
+        // `--hp 0` turns the high-pass off; anything else must be a usable cutoff frequency.
+        let hp: f32 = match arg_value(&args, "--hp") {
+            None => 90.0,
+            Some(v) => v.parse().map_err(|_| anyhow::anyhow!("--hp expects a frequency in Hz, got \"{v}\""))?,
+        };
+        if hp != 0.0 && !(dsp::MIN_HP_HZ..=dsp::MAX_HP_HZ).contains(&hp) {
+            anyhow::bail!("--hp must be 0 (off) or between {} and {} Hz, got {hp}", dsp::MIN_HP_HZ, dsp::MAX_HP_HZ);
+        }
+        let params = dsp::Params::new(!has("--no-denoise"), hp > 0.0, true, has("--agc"));
         params.gate.store(!has("--no-gate"), Relaxed);
-        let hp = arg_value(&args, "--hp").and_then(|v| v.parse().ok()).unwrap_or(90.0);
         let engine = parse_engine(&args)?;
         wavio::write_mono_48k(Path::new(out), &dsp::process_buffer_engine(params, &input, hp, engine))?;
         return Ok(());
@@ -122,14 +129,16 @@ fn main() -> anyhow::Result<()> {
 fn restore_default() -> anyhow::Result<()> {
     let st = settings::Settings::load();
     let mics = devices::microphones();
-    let cur = devices::default_capture_id();
-    if mics.iter().any(|d| Some(&d.id) == cur.as_ref()) {
+    // Check every role: Discord/Teams follow Communications, which can be stuck on the dead
+    // virtual mic even when Console already points at a real one.
+    let stuck = devices::capture_roles_where(|d| d.is_virtual);
+    if stuck.is_empty() {
         println!("Default recording device is already a real microphone.");
         return Ok(());
     }
     let target = mics.iter().find(|d| d.id == st.previous_default_input_id).or_else(|| mics.first());
     let Some(t) = target else { anyhow::bail!("No microphone found") };
-    sordino::defaultmic::set_default_capture(&t.id)?;
+    sordino::defaultmic::set_default_capture_roles(&t.id, &stuck)?;
     println!("Default recording device set to: {}", t.name);
     Ok(())
 }

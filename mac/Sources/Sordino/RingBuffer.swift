@@ -30,7 +30,10 @@ final class RingBuffer {
 
     deinit { buf.deallocate(); lock.deallocate() }
 
-    func write(_ p: UnsafePointer<Float>, _ n: Int) {
+    func write(_ data: UnsafePointer<Float>, _ count: Int) {
+        // A single write bigger than the buffer would wrap over itself; keep only its tail.
+        let n = min(count, cap)
+        let p = data + (count - n)
         os_unfair_lock_lock(lock)
         for i in 0..<n { buf[(w + i) % cap] = p[i] }
         w += n

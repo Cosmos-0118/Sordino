@@ -4,13 +4,17 @@
 //! which is what RNNoise expects. The chain is stateful and streaming: feed it any number of
 //! samples and it returns whole frames as they become available.
 
-use crate::dpdfnet::{Dpdfnet, Size};
+use crate::dpdfnet::{Dpdfnet, Size, LATENCY_HOPS};
 use nnnoiseless::DenoiseState;
+use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 
 pub const SAMPLE_RATE: u32 = 48_000;
+/// Usable range for the high-pass cutoff (Hz); `0` means "off" where a CLI accepts it.
+pub const MIN_HP_HZ: f32 = 10.0;
+pub const MAX_HP_HZ: f32 = SAMPLE_RATE as f32 / 2.0 - 100.0;
 pub const FRAME: usize = DenoiseState::FRAME_SIZE; // 480 samples = 10 ms
 
 /// Which neural denoiser runs inside the chain.
@@ -203,6 +207,10 @@ struct Biquad {
 
 impl Biquad {
     fn highpass(freq: f32) -> Self {
+        // Keep the poles inside the unit circle for any requested cutoff (0 or negative would be
+        // marginally stable/unstable; Nyquist would zero every coefficient). Below ~10 Hz the f32
+        // biquad is numerically poor anyway.
+        let freq = freq.clamp(MIN_HP_HZ, MAX_HP_HZ);
         let w0 = 2.0 * PI * freq / SAMPLE_RATE as f32;
         let alpha = w0.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
         let cw = w0.cos();
@@ -268,19 +276,31 @@ impl Biquad {
 /// Unity-compensated pre-denoiser leveler + quiet-room whisper cue.
 /// Lifts quiet voices/whispers into DPDFNet's training dynamic range (up to +12 dB, bounded by
 /// ambient noise floor and peak headroom) before STFT, then divides back out after DPDFNet's
-/// 1-hop lag so overall gain stays exact. Also tracks the ambient floor, input vocal-band ratio,
-/// and crest factor so unvoiced whispers that DPDFNet over-suppresses can be rescued cleanly
-/// without leaking stationary room noise or keyboard clicks.
+/// [`LATENCY_HOPS`] of lag so overall gain stays exact. Also tracks the ambient floor, input
+/// vocal-band ratio, crest factor and envelope modulation so unvoiced whispers that DPDFNet
+/// over-suppresses can be rescued cleanly without leaking stationary room noise or keyboard clicks.
 struct PreLeveler {
     gain: f32,
-    prev_gain: f32,
-    prev_prev_gain: f32,
+    /// `(start, end)` gain ramps applied to the last [`LATENCY_HOPS`] frames, oldest first. The
+    /// front entry is the one belonging to the frame DPDFNet is emitting right now.
+    applied: VecDeque<(f32, f32)>,
     noise_floor: f32,
     rms_env: f32,
     in_bp: Biquad,
     whisper_streak: u32,
     rescue_blend: f32,
+    /// Recent per-frame input level in dB; its spread tells speech (syllabic) from steady noise.
+    env_db: [f32; MOD_WIN],
+    env_pos: usize,
+    env_len: usize,
 }
+
+/// Frames (10 ms each) over which envelope modulation is measured.
+const MOD_WIN: usize = 30;
+/// Minimum standard deviation (dB) of the frame level over [`MOD_WIN`] for a signal to count as
+/// speech-like. Stationary noise measures about 0.6-1.9 dB (even narrow-band hiss); whispers
+/// measure 2.3+ dB.
+const MOD_MIN_DB: f32 = 2.2;
 
 impl PreLeveler {
     const TARGET_RMS: f32 = 0.055; // -25 dBFS into denoiser
@@ -291,30 +311,42 @@ impl PreLeveler {
     fn new() -> Self {
         Self {
             gain: 1.0,
-            prev_gain: 1.0,
-            prev_prev_gain: 1.0,
+            applied: std::iter::repeat_n((1.0, 1.0), LATENCY_HOPS).collect(),
             noise_floor: 0.002,
             rms_env: 0.05,
             in_bp: Biquad::bandpass(1800.0, 0.55), // whisper formant / intelligibility band (~600–4800 Hz)
             whisper_streak: 0,
             rescue_blend: 0.0,
+            env_db: [0.0; MOD_WIN],
+            env_pos: 0,
+            env_len: 0,
         }
     }
 
-    /// Computes pre-gain for this frame and returns `(pre_start, pre_end, inv_start, inv_end, rescue_blend)`.
-    /// `inv_*` compensates the previous frame's gain (matching DPDFNet's 1-hop latency).
-    fn update(&mut self, frame: &[f32], active: bool) -> (f32, f32, f32, f32, f32) {
-        let pre_start = self.gain;
-        let inv_start = 1.0 / self.prev_prev_gain;
-        let inv_end = 1.0 / self.prev_gain;
-        self.prev_prev_gain = self.prev_gain;
-        self.prev_gain = self.gain;
+    /// Standard deviation (dB) of the recent frame level, or `None` until the window has filled.
+    fn modulation_db(&self) -> Option<f32> {
+        if self.env_len < MOD_WIN {
+            return None;
+        }
+        let mean = self.env_db.iter().sum::<f32>() / MOD_WIN as f32;
+        let var = self.env_db.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / MOD_WIN as f32;
+        Some(var.sqrt())
+    }
+
+    /// Computes this frame's pre-gain and returns
+    /// `(pre_gain_ramp, inverse_ramp, rescue_blend)`, each ramp a `(start, end)` pair of linear
+    /// gains. `pre_gain_ramp` is applied to the frame going into DPDFNet; `inverse_ramp` is the
+    /// ramp that was applied [`LATENCY_HOPS`] frames ago, i.e. to the audio coming out now.
+    fn update(&mut self, frame: &[f32], active: bool) -> ((f32, f32), (f32, f32), f32) {
+        let inv = self.applied.pop_front().unwrap_or((1.0, 1.0));
 
         if !active {
-            self.gain += (1.0 - self.gain) * 0.1;
+            self.gain = 1.0;
             self.whisper_streak = 0;
             self.rescue_blend *= 0.7;
-            return (pre_start, self.gain, inv_start, inv_end, 0.0);
+            self.env_len = 0;
+            self.applied.push_back((1.0, 1.0));
+            return ((1.0, 1.0), inv, 0.0);
         }
 
         let mut e_tot = 0.0f32;
@@ -329,6 +361,10 @@ impl PreLeveler {
         let rms = (e_tot / frame.len().max(1) as f32).sqrt();
         let band_ratio = e_band / (e_tot + 1e-12);
         let crest = peak / (rms + 1e-9);
+
+        self.env_db[self.env_pos] = lin_to_db(rms + 1e-9);
+        self.env_pos = (self.env_pos + 1) % MOD_WIN;
+        self.env_len = (self.env_len + 1).min(MOD_WIN);
 
         // Asymmetric ambient floor tracker: falls quickly on quiet frames, rises very slowly.
         if rms < self.noise_floor {
@@ -353,22 +389,28 @@ impl PreLeveler {
         // Don't overload DPDFNet in loud-fan rooms.
         let noise_cap = (Self::MAX_NOISE_OUT / self.noise_floor).clamp(1.0, Self::MAX_GAIN);
         want = want.min(noise_cap);
-        // Immediate peak headroom safety cap.
-        if peak > 1e-4 {
-            let peak_cap = (Self::PEAK_CEIL / peak).clamp(1.0, Self::MAX_GAIN);
-            want = want.min(peak_cap);
-        }
+        // Peak headroom: the boosted frame must never reach the +/-1.0 clamp in front of the STFT
+        // (a hard clip is broadband distortion DPDFNet then mistakes for noise). The ramp's start
+        // is capped too, not only its end, so a loud syllable after quiet speech is never clipped.
+        let peak_cap = if peak > 1e-4 { (Self::PEAK_CEIL / peak).clamp(1.0, Self::MAX_GAIN) } else { Self::MAX_GAIN };
+        want = want.min(peak_cap);
 
-        let k = if want < self.gain { 0.45 } else { 0.04 };
-        self.gain += (want - self.gain) * k;
+        let start = self.gain.min(peak_cap);
+        let k = if want < start { 0.45 } else { 0.04 };
+        let end = (start + (want - start) * k).min(peak_cap);
+        self.gain = end;
+        self.applied.push_back((start, end));
 
         // Quiet-room unvoiced whisper detector:
         // - Must sit at least +8 dB (2.5x) above ambient room floor (rejects fans/AC/hiss/hum)
         // - Quiet level (< -28 dBFS) with moderate crest factor (< 4.8, rejects sharp keystrokes)
         // - Concentrated in whisper formant band (band_ratio >= 0.50)
+        // - Level fluctuating like syllables (rejects stationary noise that merely outgrew the
+        //   slow floor tracker, e.g. an AC vent or fan switching on)
         // - Sustained for >= 5 frames (50 ms, rejects impulsive 10-30 ms clicks)
         let snr_ok = rms > self.noise_floor * 2.5 && rms > 4e-4 && rms < 0.04;
-        let whisper_like = snr_ok && crest < 4.8 && band_ratio >= 0.50;
+        let modulated = self.modulation_db().is_some_and(|m| m >= MOD_MIN_DB);
+        let whisper_like = snr_ok && crest < 4.8 && band_ratio >= 0.50 && modulated;
         if whisper_like {
             self.whisper_streak = self.whisper_streak.saturating_add(1);
         } else {
@@ -378,7 +420,7 @@ impl PreLeveler {
         let rk = if target_rescue > self.rescue_blend { 0.35 } else { 0.25 };
         self.rescue_blend += (target_rescue - self.rescue_blend) * rk;
 
-        (pre_start, self.gain, inv_start, inv_end, self.rescue_blend)
+        ((start, end), inv, self.rescue_blend)
     }
 }
 
@@ -395,6 +437,14 @@ const LOOKAHEAD: usize = 192; // 4 ms
 impl Limiter {
     fn new() -> Self {
         Self { delay: vec![0.0; LOOKAHEAD], pos: 0, gain: 1.0 }
+    }
+
+    /// Forgets the look-ahead audio so a limiter that was bypassed doesn't replay stale samples
+    /// (and a stale gain reduction) when it is switched back on.
+    fn reset(&mut self) {
+        self.delay.fill(0.0);
+        self.pos = 0;
+        self.gain = 1.0;
     }
 
     #[inline]
@@ -469,7 +519,11 @@ impl Agc {
             let delta = want_db - self.gain_db;
             // Cut quickly on loud talkers, boost smoothly on quiet talkers / whispers.
             let step = if delta < 0.0 {
-                (delta * 0.25).max(-0.6)
+                // Emergency back-off: after a whisper the gain is high, so a normal-level word
+                // would slam the limiter for hundreds of ms at the usual -0.6 dB/frame.
+                let post_rms = frame_rms * db_to_lin(self.gain_db + self.upward_db);
+                let fastest = if post_rms > 0.35 { -3.0 } else { -0.6 };
+                (delta * 0.25).max(fastest)
             } else {
                 (delta * 0.08).min(0.22)
             };
@@ -522,14 +576,6 @@ impl Gate {
 
     fn new() -> Self {
         Self { gain: 0.0, hold: 0, open: false, voiced_streak: 0, whisper_streak: 0, noise_rms: 1e-5 }
-    }
-
-    fn reset(&mut self) {
-        self.gain = 1.0;
-        self.hold = Self::HOLD_FRAMES;
-        self.open = true;
-        self.voiced_streak = 0;
-        self.whisper_streak = 0;
     }
 
     /// Returns `(gain_start, gain_end, speech_active)`.
@@ -599,7 +645,9 @@ pub struct Chain {
     hp: Biquad,
     presence: Biquad,
     pre: PreLeveler,
-    prev_dry: [f32; FRAME], // 1-hop delayed HPF'd input matching DPDFNet's 10 ms lag for whisper rescue
+    /// HPF'd input of the last [`LATENCY_HOPS`] frames, oldest first: the dry signal time-aligned
+    /// with what DPDFNet is emitting now, for whisper rescue.
+    dry_hist: VecDeque<[f32; FRAME]>,
     dn: Denoiser,
     gate: Gate,
     agc: Agc,
@@ -626,7 +674,7 @@ impl Chain {
             hp: Biquad::highpass(hp_hz),
             presence: Biquad::peaking_eq(3000.0, 0.9, 3.0),
             pre: PreLeveler::new(),
-            prev_dry: [0.0; FRAME],
+            dry_hist: std::iter::repeat_n([0.0; FRAME], LATENCY_HOPS).collect(),
             dn: Denoiser::new(engine),
             gate: Gate::new(),
             agc: Agc::new(),
@@ -676,14 +724,14 @@ impl Chain {
         }
 
         // Pre-level quiet input into DPDFNet's dynamic range, then restore unity gain after its
-        // 1-hop lag so whispers aren't crushed while overall level stays calibrated.
+        // lag so whispers aren't crushed while overall level stays calibrated.
         let use_pre = dn_on && self.dn.is_dpdfnet();
-        let (pre0, pre1, inv0, inv1, rescue_blend) = self.pre.update(f, use_pre);
+        let ((pre0, pre1), (inv0, inv1), rescue_blend) = self.pre.update(f, use_pre);
         let mut dn_in = *f;
         if use_pre {
             for i in 0..FRAME {
                 let t = (i + 1) as f32 / FRAME as f32;
-                dn_in[i] = (dn_in[i] * (pre0 + (pre1 - pre0) * t)).clamp(-1.0, 1.0);
+                dn_in[i] *= pre0 + (pre1 - pre0) * t;
             }
         }
 
@@ -691,26 +739,31 @@ impl Chain {
         let mut wet = [0.0f32; FRAME];
         let mut feat = self.dn.run(&dn_in, &mut wet);
         if use_pre {
+            // Divide out exactly the gain ramp that was applied to the audio now leaving DPDFNet.
             for i in 0..FRAME {
                 let t = (i + 1) as f32 / FRAME as f32;
-                wet[i] *= inv0 + (inv1 - inv0) * t;
+                wet[i] /= inv0 + (inv1 - inv0) * t;
             }
             // Quiet-room unvoiced whisper rescue (attenuation limit): when sustained soft vocal-band
             // speech sits clearly above the ambient room floor (+8 dB) but DPDFNet over-attenuated
             // it as breathy noise, blend a bounded amount of the time-aligned HPF'd frame back in.
+            // The detector (`rescue_blend`) sees the present while the audio it acts on is
+            // LATENCY_HOPS old, so it effectively looks ahead and catches the word's onset.
+            let dry = self.dry_hist.front().copied().unwrap_or([0.0; FRAME]);
             if rescue_blend > 0.02 {
                 let wet_rms = frame_rms(&wet);
-                let dry_rms = frame_rms(&self.prev_dry);
+                let dry_rms = frame_rms(&dry);
                 if dry_rms > 4e-4 && wet_rms < dry_rms * 0.5 {
                     let mix = rescue_blend * (1.0 - (wet_rms / dry_rms).clamp(0.0, 1.0));
                     for i in 0..FRAME {
-                        wet[i] = wet[i] * (1.0 - mix) + self.prev_dry[i] * mix;
+                        wet[i] = wet[i] * (1.0 - mix) + dry[i] * mix;
                     }
                 }
             }
             feat.rms = frame_rms(&wet);
         }
-        self.prev_dry = *f;
+        self.dry_hist.pop_front();
+        self.dry_hist.push_back(*f);
 
         if self.warmup {
             // The first frame carries fade-in artifacts.
@@ -730,15 +783,12 @@ impl Chain {
             f[i] = f[i] * (1.0 - w) + wet[i] * w;
         }
 
-        // Gate decision runs for ALL engines when denoise & gate are enabled.
+        // The speech detector runs every frame for ALL engines, whatever the toggles: the AGC
+        // needs it to tell speech from room noise even with the gate or denoising switched off.
+        // The denoiser keeps running while "off", so its VAD is valid.
         let whisper_rescued = use_pre && rescue_blend > 0.15;
-        let (g0, g1, speech_active) = if dn_on && gate_on {
-            self.gate.update(&feat, whisper_rescued)
-        } else {
-            self.gate.reset();
-            let active = if dn_on { feat.prob > 0.35 || feat.rms > 0.002 } else { true };
-            (1.0, 1.0, active)
-        };
+        let (gate_g0, gate_g1, speech_active) = self.gate.update(&feat, whisper_rescued);
+        let (g0, g1) = if dn_on && gate_on { (gate_g0, gate_g1) } else { (1.0, 1.0) };
 
         // AGC2 runs before the zero-squelch gate multiplication so when the gate is closed (0.0),
         // VB-CABLE receives exact digital silence regardless of AGC gain.
@@ -748,6 +798,9 @@ impl Chain {
 
         // Fast 3 ms attack ramp when opening from closed so word onsets are never dulled.
         let open_ramp_len = if g1 > g0 { (SAMPLE_RATE as usize * 3) / 1000 } else { FRAME };
+        if !lim_on {
+            self.lim.reset();
+        }
         let mut peak = 0.0f32;
         for i in 0..FRAME {
             let tf = (i + 1) as f32 / FRAME as f32;
@@ -792,4 +845,162 @@ pub fn process_buffer_engine(params: Arc<Params>, input: &[f32], hp_hz: f32, eng
     let pad = (FRAME - input.len() % FRAME) % FRAME;
     chain.process(&vec![0.0; pad], &mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic white noise in [-1, 1] (xorshift), so tests never flake.
+    struct Rng(u32);
+    impl Rng {
+        fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            (self.0 as f32 / u32::MAX as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// Frames of white noise band-limited around the whisper band, scaled to `rms_db` dBFS.
+    /// `am_hz > 0` adds syllable-like amplitude modulation (what real whispers have).
+    fn band_noise(rng: &mut Rng, frames: usize, rms_db: f32, am_hz: f32, t0: &mut f32) -> Vec<[f32; FRAME]> {
+        let mut bp = Biquad::bandpass(1800.0, 1.0);
+        let scale = db_to_lin(rms_db) / 0.3; // bandpassed white noise has ~0.3 rms at unit input
+        (0..frames)
+            .map(|_| {
+                let mut f = [0.0f32; FRAME];
+                for s in f.iter_mut() {
+                    let am = if am_hz > 0.0 { 1.0 + 0.9 * (2.0 * PI * am_hz * *t0).sin() } else { 1.0 };
+                    *s = bp.run(rng.next()) * scale * am;
+                    *t0 += 1.0 / SAMPLE_RATE as f32;
+                }
+                f
+            })
+            .collect()
+    }
+
+    fn quiet_room(rng: &mut Rng, frames: usize) -> Vec<[f32; FRAME]> {
+        (0..frames).map(|_| std::array::from_fn(|_| rng.next() * db_to_lin(-65.0) * 1.7)).collect()
+    }
+
+    #[test]
+    fn stationary_noise_onset_never_triggers_whisper_rescue() {
+        let mut rng = Rng(0x1234_5678);
+        let mut pre = PreLeveler::new();
+        for f in quiet_room(&mut rng, 200) {
+            pre.update(&f, true);
+        }
+        // An AC vent / fan whine switches on: well above the slowly-rising floor tracker for
+        // many seconds, in the whisper band, with a flat envelope.
+        let mut t = 0.0;
+        let mut late_max = 0.0f32;
+        for (i, f) in band_noise(&mut rng, 1500, -38.0, 0.0, &mut t).iter().enumerate() {
+            let (_, _, blend) = pre.update(f, true);
+            // Allow the first window to fill (the onset itself looks like a word onset).
+            if i >= 2 * MOD_WIN {
+                late_max = late_max.max(blend);
+            }
+        }
+        assert!(late_max < 0.02, "steady noise kept whisper rescue on (blend {late_max})");
+    }
+
+    #[test]
+    fn syllabic_whisper_still_triggers_whisper_rescue() {
+        let mut rng = Rng(0x9e37_79b9);
+        let mut pre = PreLeveler::new();
+        for f in quiet_room(&mut rng, 200) {
+            pre.update(&f, true);
+        }
+        let mut t = 0.0;
+        let mut max_blend = 0.0f32;
+        for f in band_noise(&mut rng, 300, -40.0, 4.0, &mut t) {
+            let (_, _, blend) = pre.update(&f, true);
+            max_blend = max_blend.max(blend);
+        }
+        assert!(max_blend > 0.15, "modulated whisper never rescued (blend {max_blend})");
+    }
+
+    #[test]
+    fn pre_gain_never_clips_a_loud_syllable_after_quiet_speech() {
+        let mut rng = Rng(7);
+        let mut pre = PreLeveler::new();
+        let mut t = 0.0;
+        // Quiet speech lifts the pre-gain towards its +12 dB maximum ...
+        for f in band_noise(&mut rng, 200, -38.0, 4.0, &mut t) {
+            pre.update(&f, true);
+        }
+        assert!(pre.gain > 2.0, "setup failed: gain {}", pre.gain);
+        // ... then a near-full-scale frame arrives.
+        let loud: [f32; FRAME] = std::array::from_fn(|i| 0.95 * (i as f32 * 0.07).sin());
+        let ((s, e), _, _) = pre.update(&loud, true);
+        assert!(s * 0.95 <= 1.0 && e * 0.95 <= 1.0, "boosted frame would clip: ramp {s}..{e}");
+    }
+
+    #[test]
+    fn inverse_gain_is_the_ramp_applied_latency_hops_ago() {
+        let mut rng = Rng(99);
+        let mut pre = PreLeveler::new();
+        let mut t = 0.0;
+        let mut applied = vec![];
+        for (i, f) in band_noise(&mut rng, 40, -40.0, 3.0, &mut t).iter().enumerate() {
+            let (ramp, inv, _) = pre.update(f, true);
+            applied.push(ramp);
+            let expect = if i >= LATENCY_HOPS { applied[i - LATENCY_HOPS] } else { (1.0, 1.0) };
+            assert_eq!(inv, expect, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn highpass_is_stable_for_any_cutoff() {
+        for hz in [-10.0, 0.0, 1.0, 10.0, 90.0, 23_900.0, 24_000.0, 1e9] {
+            let mut hp = Biquad::highpass(hz);
+            // Jury stability triangle (with slack for f32 rounding at very low cutoffs).
+            assert!(hp.a2.abs() < 1.0 && hp.a1.abs() <= 1.0 + hp.a2 + 1e-5, "unstable at {hz} Hz: a1 {} a2 {}", hp.a1, hp.a2);
+            let y: f32 = (0..48_000).map(|i| hp.run(((i % 97) as f32 - 48.0) / 100.0).abs()).fold(0.0, f32::max);
+            assert!(y.is_finite() && y < 4.0, "blew up at {hz} Hz: {y}");
+        }
+    }
+
+    #[test]
+    fn limiter_reset_forgets_stale_audio() {
+        let mut lim = Limiter::new();
+        for _ in 0..LOOKAHEAD * 2 {
+            lim.run(0.8);
+        }
+        lim.reset();
+        let first = lim.run(0.0);
+        assert_eq!(first, 0.0, "stale look-ahead audio replayed after reset");
+    }
+
+    #[test]
+    fn agc_backs_off_fast_when_loud_speech_follows_a_whisper() {
+        let mut agc = Agc::new();
+        agc.gain_db = 26.0;
+        let loud = [0.16f32; FRAME]; // about -16 dBFS
+        for _ in 0..12 {
+            agc.update(&loud, true, true);
+        }
+        // Back to a level where the boosted speech no longer hammers the limiter (RMS < 0.35).
+        let post_rms = 0.16 * db_to_lin(agc.gain_db + agc.upward_db);
+        assert!(post_rms < 0.4, "AGC still at {:+.1} dB after 120 ms of loud speech (post RMS {post_rms})", agc.gain_db);
+    }
+
+    #[test]
+    fn agc_does_not_pump_room_noise_when_denoise_is_off() {
+        // Denoise OFF + Auto Gain ON must not lift a quiet room by tens of dB.
+        let engine = Engine::Dpdfnet2;
+        if !engine.is_available() {
+            return; // model files not present in this environment
+        }
+        let mut rng = Rng(42);
+        let mut chain = Chain::with_engine(Params::new(false, true, true, true), 90.0, engine);
+        let n = SAMPLE_RATE as usize * 5;
+        let room: Vec<f32> = (0..n).map(|_| rng.next() * db_to_lin(-55.0) * 1.7).collect();
+        let mut out = vec![];
+        chain.process(&room, &mut out);
+        let sec = SAMPLE_RATE as usize;
+        let gain_db = lin_to_db(frame_rms(&out[out.len() - sec..])) - lin_to_db(frame_rms(&room[n - sec..]));
+        assert!(gain_db < 6.0, "room noise lifted by {gain_db:.1} dB");
+    }
 }

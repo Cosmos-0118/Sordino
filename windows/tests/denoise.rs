@@ -50,7 +50,8 @@ fn noise_gain(clean: &[f32], noise: &[f32], mask: &[bool], snr_db: f64) -> f32 {
 fn find_lag(clean: &[f32], out: &[f32]) -> usize {
     let n = clean.len().min(out.len()) - SR / 10;
     let mut best = (f64::MIN, 0usize);
-    for lag in 0..(SR / 20) {
+    // DPDFNet delays by LATENCY_HOPS (50 ms) plus the 4 ms limiter look-ahead, so search past 100 ms.
+    for lag in 0..(SR / 10) {
         let dot: f64 = (0..n).step_by(3).map(|i| (clean[i].abs() * out[i + lag].abs()) as f64).sum();
         if dot > best.0 {
             best = (dot, lag);
@@ -130,7 +131,8 @@ fn check_suppression(engine: dsp::Engine) {
         let tail_out = &out[tail_start..n - SR * 3 / 10];
         let suppression = db(rms(tail)) - db(rms(tail_out));
 
-        // Speech level retention (mask applies to out too; delay is ~10 ms, well under a frame).
+        // Speech level retention (mask applies to out too; the delay is small next to the 20 ms
+        // masks, and `find_lag` aligns the magnitude-SNR comparison exactly).
         let speech_in = db(rms(&masked(&clean, &mask, true)));
         let speech_out = db(rms(&masked(&out[..n], &mask, true)));
         let speech_loss = speech_in - speech_out;
@@ -173,6 +175,22 @@ fn rnnoise_suppresses_noise_and_keeps_speech() {
 #[test]
 fn dpdfnet_suppresses_noise_and_keeps_speech() {
     check_suppression(dsp::Engine::Dpdfnet2);
+}
+
+#[test]
+fn dpdfnet_delay_matches_latency_hops() {
+    // The pre-leveler's inverse gain and the whisper-rescue dry signal are delayed by
+    // `LATENCY_HOPS`; if a model change alters the real delay they silently misalign.
+    let clean = fixture("clean.wav");
+    let params = dsp::Params::new(true, true, true, false);
+    params.gate.store(false, std::sync::atomic::Ordering::Relaxed);
+    let limiter_lookahead = SR / 250; // 4 ms
+    let expected = sordino::dpdfnet::LATENCY_HOPS * dsp::FRAME + limiter_lookahead;
+    for engine in [dsp::Engine::Dpdfnet2, dsp::Engine::Dpdfnet8] {
+        let out = dsp::process_buffer_engine(params.clone(), &clean, 90.0, engine);
+        let lag = find_lag(&clean, &out);
+        assert!(lag.abs_diff(expected) <= 48, "{engine:?} delays by {lag} samples, expected about {expected}");
+    }
 }
 
 #[test]

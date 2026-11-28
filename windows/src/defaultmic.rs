@@ -30,11 +30,16 @@ const CLSID_POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af
 
 /// Makes `device_id` the default recording device for all roles. COM must be initialised.
 pub fn set_default_capture(device_id: &str) -> windows::core::Result<()> {
+    set_default_capture_roles(device_id, &[0, 1, 2])
+}
+
+/// Makes `device_id` the default recording device for just these roles
+/// (eConsole = 0, eMultimedia = 1, eCommunications = 2). COM must be initialised.
+pub fn set_default_capture_roles(device_id: &str, roles: &[i32]) -> windows::core::Result<()> {
     let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let policy: IPolicyConfig = CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL)?;
-        // eConsole = 0, eMultimedia = 1, eCommunications = 2
-        for role in [0, 1, 2] {
+        for &role in roles {
             policy.SetDefaultEndpoint(PCWSTR(wide.as_ptr()), role).ok()?;
         }
     }

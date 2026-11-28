@@ -1,6 +1,6 @@
 [package]
 name = "sordino"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "Studio-clean voice for Discord, Zoom and games on Windows"
 

@@ -108,8 +108,9 @@ final class Pipeline: ObservableObject {
     var activeInput: AudioDevice? {
         inputs.first { $0.uid == inputUID } ?? inputs.first { $0.name.contains("MacBook") } ?? inputs.first
     }
-    /// The virtual mic actually used: the user's choice, else BlackHole. Never falls back to real speakers.
-    var activeOutput: AudioDevice? { outputs.first { $0.uid == outputUID } ?? blackHole }
+    /// The virtual mic actually used: the user's choice, else BlackHole. Only ever a virtual mic: a real
+    /// output would play the user's voice out of the speakers and straight back into the mic.
+    var activeOutput: AudioDevice? { outputs.first { $0.uid == outputUID && $0.isVirtualLoopback } ?? blackHole }
 
     init() {
         inputUID = d.string(forKey: "inputUID") ?? ""
@@ -387,7 +388,10 @@ final class Pipeline: ObservableObject {
             log.info("running: mode=\(cfg.mode.rawValue, privacy: .public)")
             return nil
         } catch {
+            // The default input may already point at the (now silent) virtual mic: give it back while
+            // retrying. A later successful build makes the virtual mic the default again.
             teardown()
+            restoreDefaultInput()
             log.error("build failed: \(error.localizedDescription, privacy: .public)")
             return error.localizedDescription
         }
@@ -423,9 +427,12 @@ final class Pipeline: ObservableObject {
     private func restoreDefaultInput() {
         let all = AudioDevices.all()
         guard let bh = all.first(where: { $0.name.lowercased().contains("blackhole") && $0.hasInput }),
-              AudioDevices.defaultInput() == bh.id,
-              let uid = d.string(forKey: "previousDefaultInputUID"),
-              let prev = all.first(where: { $0.uid == uid && $0.hasInput }) else { return }
+              AudioDevices.defaultInput() == bh.id else { return }
+        // The previous mic may have been unplugged meanwhile: fall back to any real microphone
+        // rather than leaving every app on a silent virtual one.
+        let prevUID = d.string(forKey: "previousDefaultInputUID")
+        guard let prev = all.first(where: { $0.uid == prevUID && $0.hasInput && !$0.isVirtualLoopback })
+            ?? all.first(where: { $0.hasInput && !$0.isVirtualLoopback && !$0.isInternalAggregate }) else { return }
         AudioDevices.setDefaultInput(prev.id)
     }
 
@@ -462,7 +469,12 @@ final class Pipeline: ObservableObject {
             }
             print("t=\(n) running=\(self.isRunning) peak=\(String(format: "%.6f", self.rawLevel)) out=\(name(out)) bound=\(bound) defaultInput=\(name(AudioDevices.defaultInput())) health=\(problem ?? "ok") status=\(self.status ?? "-") under=\(ring?.underruns ?? -1) over=\(ring?.overflows ?? -1) wN=\(ring?.lastWriteN ?? -1) rN=\(ring?.lastReadN ?? -1)")
             fflush(stdout)
-            if n >= limit { self.stop(persist: false); t.invalidate(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) } }
+            if n >= limit {
+                self.stop(persist: false)
+                self.q.sync {}   // `stop` queues the teardown (which restores the default mic) on `q`: wait for it
+                t.invalidate()
+                exit(0)
+            }
         }
     }
 }

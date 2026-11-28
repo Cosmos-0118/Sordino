@@ -117,29 +117,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if pipe.inputs.isEmpty { addDisabled("No microphones found") }
 
-        // Virtual mic (loopback devices first, everything else tucked into a submenu)
+        // Virtual mic: only loopback devices. A real output here would send the voice to the speakers.
         menu.addItem(.separator())
         addSection("Virtual Mic")
         let activeOut = pipe.activeOutput?.uid
-        let loopbacks = pipe.outputs.filter { $0.isVirtualLoopback || $0.uid == activeOut }
-        let others = pipe.outputs.filter { !($0.isVirtualLoopback || $0.uid == activeOut) }
+        let loopbacks = pipe.outputs.filter { $0.isVirtualLoopback }
         for dev in loopbacks {
             addChoice(dev.name, symbol: "point.3.connected.trianglepath.dotted", selected: dev.uid == activeOut) { [weak self] in
                 self?.pipe.outputUID = dev.uid
             }
         }
         if loopbacks.isEmpty { addDisabled("No virtual mic found") }
-        if !others.isEmpty {
-            let more = NSMenuItem(title: "Other Devices", action: nil, keyEquivalent: "")
-            more.image = CircleIcon.make(symbol: "ellipsis", selected: false)
-            let sub = NSMenu()
-            for dev in others {
-                let item = ActionItem(dev.name) { [weak self] in self?.pipe.outputUID = dev.uid }
-                sub.addItem(item)
-            }
-            more.submenu = sub
-            menu.addItem(more)
-        }
 
         // Processing
         menu.addItem(.separator())
